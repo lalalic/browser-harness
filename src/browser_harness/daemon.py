@@ -1,5 +1,5 @@
 """CDP WS holder + IPC relay (Unix socket on POSIX, TCP loopback on Windows). One daemon per BU_NAME."""
-import asyncio, json, os, platform, socket, sys, time, urllib.error, urllib.request
+import asyncio, json, os, platform, socket, sys, threading, time, urllib.error, urllib.request
 from urllib.parse import urlparse
 from collections import deque
 from pathlib import Path
@@ -7,6 +7,7 @@ from pathlib import Path
 from . import _ipc as ipc
 from . import auth
 from . import paths
+from .admin import _process_start_time
 from cdp_use.client import CDPClient
 
 
@@ -35,6 +36,41 @@ SOCK = ipc.sock_addr(NAME)
 LOG = str(ipc.log_path(NAME))
 PID = str(ipc.pid_path(NAME))
 BUF = 500
+
+OWNER_PID = int(os.environ.get("BH_OWNER_PID") or "0")
+OWNER_STARTED = os.environ.get("BH_OWNER_STARTED") or None
+OWNER_TOKEN = os.environ.get("BH_OWNER_TOKEN") or None
+OWNER_PIPE_FD = int(os.environ.get("BH_OWNER_PIPE_FD") or "-1")
+
+
+def owner_alive():
+    """Reject PID reuse; unknown fingerprints cannot prove ownership."""
+    return bool(OWNER_PID > 0 and OWNER_STARTED
+                and _process_start_time(OWNER_PID) == OWNER_STARTED)
+
+
+def monitor_owner():
+    if not OWNER_TOKEN:
+        return
+    if OWNER_PIPE_FD >= 0:
+        # Readable EOF proves that the actual spawning session generation
+        # exited, SIGKILLed, or exec'd; a reused PID cannot keep this alive.
+        try:
+            while os.read(OWNER_PIPE_FD, 1):
+                pass
+        except OSError:
+            pass
+        os._exit(0)
+    # Windows compatibility: kernel process creation time + PID identity.
+    while owner_alive():
+        time.sleep(0.5)
+    os._exit(0)
+
+
+def begin_owner_monitor():
+    if OWNER_TOKEN:
+        threading.Thread(target=monitor_owner, name="harness-parent-watch", daemon=True).start()
+
 _MAC_PROFILES = (
     "Library/Application Support/Google/Chrome",
     "Library/Application Support/Google/Chrome Canary",
@@ -420,6 +456,18 @@ class _PatientCDPClient(CDPClient):
         self.ws = await websockets.connect(self.url, **connect_kwargs)
         self._message_handler_task = asyncio.create_task(self._handle_messages())
 
+    async def stop(self):
+        """Stop cleanly even when Chrome already dropped the TCP connection."""
+        try:
+            await super().stop()
+        except Exception as exc:
+            # websockets raises ConnectionClosedError when the peer vanished
+            # without a close handshake. That is already the desired state for
+            # cleanup; letting it escape masks the reconnect/stop result.
+            if "close frame" not in str(exc).lower():
+                raise
+            self.ws = None
+
 
 class Daemon:
     def __init__(self):
@@ -435,6 +483,7 @@ class Daemon:
         self._recoveries_idle.set()
         self._shutting_down = False
         self._session_replacements = {}
+        self._cdp_reconnect_lock = asyncio.Lock()
         self.events = deque(maxlen=BUF)
         self.dialog = None
         self.stop = None  # asyncio.Event, set inside start()
@@ -662,6 +711,40 @@ class Daemon:
             return await orig(method, params, session_id)
         self.cdp._event_registry.handle_event = tap
 
+    @staticmethod
+    def _is_transport_closed(exc):
+        message = str(exc).lower()
+        return any(marker in message for marker in (
+            "no close frame received or sent",
+            "websocket connection closed",
+            "connection closed",
+            "client is not started",
+        ))
+
+    async def _reconnect_cdp(self, replaces_session):
+        """Replace a dead CDP transport and reattach the same logical tab."""
+        async with self._cdp_reconnect_lock:
+            if self._shutting_down:
+                return None
+            old = self.cdp
+            if old:
+                try:
+                    await old.stop()
+                except Exception as exc:
+                    if not self._is_transport_closed(exc):
+                        log(f"stop dead CDP transport: {exc}")
+            self.cdp = None
+            url = get_ws_url()
+            self.cdp = _PatientCDPClient(url) if BROWSER_KIND == "local" else CDPClient(url)
+            await self.cdp.start()
+            await self.attach_first_page(replaces_session=replaces_session)
+            orig = self.cdp._event_registry.handle_event
+            async def tap(method, params, session_id=None):
+                self._record_event(method, params, session_id)
+                return await orig(method, params, session_id)
+            self.cdp._event_registry.handle_event = tap
+            return self.session
+
     async def handle(self, req):
         # Token guard for Windows TCP loopback: any local process can otherwise
         # connect and issue CDP commands. expected_token() is None on POSIX so
@@ -737,6 +820,11 @@ class Daemon:
             self._schedule_tab_marker(new_session)
             return {"session_id": new_session}
         if meta == "pending_dialog": return {"dialog": self.dialog}
+        if meta == "owner_shutdown":
+            if not OWNER_TOKEN or req.get("owner_token") != OWNER_TOKEN:
+                return {"error": "not harness owner"}
+            self.stop.set()
+            return {"ok": True}
         if meta == "shutdown":
             # Flip the barrier synchronously with recovery registration, then
             # cancel/drain existing handlers. In particular, a CDP replay that
@@ -769,7 +857,7 @@ class Daemon:
             return {"result": await self.cdp.send_raw(method, params, session_id=sid)}
         except Exception as e:
             msg = str(e)
-            if "Session with given id not found" in msg and sid:
+            if ("Session with given id not found" in msg or self._is_transport_closed(e)) and sid:
                 # Explicit session callers asked for that exact session; do not
                 # silently redirect them to the daemon's current tab.
                 if req.get("session_id"):
@@ -784,11 +872,16 @@ class Daemon:
                             return {"error": "daemon is shutting down"}
                         replacement_session = self._session_replacements.get(sid)
                         if replacement_session is None and sid == self.session:
-                            log(f"stale session {sid}, re-attaching")
-                            if not await self.attach_first_page(
-                                replaces_session=sid, enable_domains=False
-                            ):
-                                return {"error": msg}
+                            if self._is_transport_closed(e):
+                                log(f"CDP transport closed for session {sid}, reconnecting")
+                                if not await self._reconnect_cdp(sid):
+                                    return {"error": msg}
+                            else:
+                                log(f"stale session {sid}, re-attaching")
+                                if not await self.attach_first_page(
+                                    replaces_session=sid, enable_domains=False
+                                ):
+                                    return {"error": msg}
                             replacement_session = self._session_replacements.get(sid)
                             recovered_here = replacement_session is not None
                     if recovered_here:
@@ -881,6 +974,7 @@ if __name__ == "__main__":
         sys.exit(0)
     open(LOG, "w").close()
     _publish_own_pid()
+    begin_owner_monitor()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

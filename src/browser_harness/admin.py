@@ -564,29 +564,29 @@ def ensure_daemon(wait=None, name=None, env=None):
             stderr_sink = open(ipc.log_path(name or NAME), "ab")
         except OSError:
             stderr_sink = subprocess.DEVNULL
-        if local:
-            with _spawn_lock(name, timeout=startup_wait) as lock:
-                if lock.fd is None:
-                    raise RuntimeError("daemon-starting: another browser-harness daemon is still starting; retry later")
-                if daemon_alive(name):
-                    if stderr_sink is not subprocess.DEVNULL:
-                        stderr_sink.close()
-                    return
-                pending_pid = _parked_daemon_pid(name) or _starting_daemon_pid(name)
-                if pending_pid:
-                    p = None
-                else:
-                    p = subprocess.Popen(
-                        [sys.executable, "-m", "browser_harness.daemon"],
-                        env=e, stdout=subprocess.DEVNULL, stderr=stderr_sink, **ipc.spawn_kwargs(),
-                    )
-                    _publish_pid(ipc.pid_path(name or NAME), p.pid)
-                    pending_pid = p.pid
-        else:
-            p = subprocess.Popen(
-                [sys.executable, "-m", "browser_harness.daemon"],
-                env=e, stdout=subprocess.DEVNULL, stderr=stderr_sink, **ipc.spawn_kwargs(),
-            )
+        # The canonical socket has one startup lock for both local Chrome
+        # discovery and explicit CDP endpoints. Otherwise concurrent cold
+        # callers may create several pending harness children.
+        with _spawn_lock(name, timeout=startup_wait) as lock:
+            if lock.fd is None:
+                raise RuntimeError("daemon-starting: another browser-harness daemon is still starting; retry later")
+            if daemon_alive(name):
+                if stderr_sink is not subprocess.DEVNULL:
+                    stderr_sink.close()
+                return
+            pending_pid = _parked_daemon_pid(name) or _starting_daemon_pid(name)
+            if pending_pid:
+                p = None
+            else:
+                p = subprocess.Popen(
+                    [sys.executable, "-m", "browser_harness.daemon"],
+                    env=e, stdout=subprocess.DEVNULL, stderr=stderr_sink,
+                    **({"pass_fds": (int(e["BH_OWNER_PIPE_FD"]),)}
+                       if os.name == "posix" and e.get("BH_OWNER_PIPE_FD") else {}),
+                    **ipc.spawn_kwargs(),
+                )
+                _publish_pid(ipc.pid_path(name or NAME), p.pid)
+                pending_pid = p.pid
         if stderr_sink is not subprocess.DEVNULL:
             stderr_sink.close()
         spawned = time.monotonic()
@@ -628,7 +628,7 @@ def ensure_daemon(wait=None, name=None, env=None):
             time.sleep(0.2)
         msg = _log_tail(name) or ""
         permission_wait = local and (msg.startswith("handshake-wait") or _needs_chrome_permission_popup(msg))
-        if local and pending_died:
+        if pending_died:
             # Serialize cleanup with publishers and remove only the generation
             # we observed. Another waiter may already have published a healthy
             # successor while this caller was leaving its wait loop.
